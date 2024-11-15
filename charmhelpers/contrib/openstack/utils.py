@@ -25,7 +25,6 @@ import re
 import itertools
 import functools
 
-import six
 import traceback
 import uuid
 import yaml
@@ -159,6 +158,12 @@ OPENSTACK_CODENAMES = OrderedDict([
     ('2021.1', 'wallaby'),
     ('2021.2', 'xena'),
     ('2022.1', 'yoga'),
+    ('2022.2', 'zed'),
+    ('2023.1', 'antelope'),
+    ('2023.2', 'bobcat'),
+    ('2024.1', 'caracal'),
+    ('2024.2', 'dalmatian'),
+    ('2025.1', 'epoxy'),
 ])
 
 # The ugly duckling - must list releases oldest to newest
@@ -362,6 +367,8 @@ def get_os_codename_install_source(src):
     rel = ''
     if src is None:
         return rel
+    if src in OPENSTACK_RELEASES:
+        return src
     if src in ['distro', 'distro-proposed', 'proposed']:
         try:
             rel = UBUNTU_OPENSTACK_RELEASE[ubuntu_rel]
@@ -399,39 +406,32 @@ def get_os_codename_version(vers):
         error_out(e)
 
 
-def get_os_version_codename(codename, version_map=OPENSTACK_CODENAMES):
+def get_os_version_codename(codename, version_map=OPENSTACK_CODENAMES,
+                            raise_exception=False):
     '''Determine OpenStack version number from codename.'''
-    for k, v in six.iteritems(version_map):
+    for k, v in version_map.items():
         if v == codename:
             return k
     e = 'Could not derive OpenStack version for '\
         'codename: %s' % codename
-    error_out(e)
-
-
-def get_os_version_codename_swift(codename):
-    '''Determine OpenStack version number of swift from codename.'''
-    for k, v in six.iteritems(SWIFT_CODENAMES):
-        if k == codename:
-            return v[-1]
-    e = 'Could not derive swift version for '\
-        'codename: %s' % codename
+    if raise_exception:
+        raise ValueError(str(e))
     error_out(e)
 
 
 def get_swift_codename(version):
     '''Determine OpenStack codename that corresponds to swift version.'''
-    codenames = [k for k, v in six.iteritems(SWIFT_CODENAMES) if version in v]
+    codenames = [k for k, v in SWIFT_CODENAMES.items() if version in v]
 
     if len(codenames) > 1:
         # If more than one release codename contains this version we determine
         # the actual codename based on the highest available install source.
         for codename in reversed(codenames):
             releases = UBUNTU_OPENSTACK_RELEASE
-            release = [k for k, v in six.iteritems(releases) if codename in v]
-            ret = subprocess.check_output(['apt-cache', 'policy', 'swift'])
-            if six.PY3:
-                ret = ret.decode('UTF-8')
+            release = [k for k, v in releases.items() if codename in v]
+            ret = (subprocess
+                   .check_output(['apt-cache', 'policy', 'swift'])
+                   .decode('UTF-8'))
             if codename in ret or release[0] in ret:
                 return codename
     elif len(codenames) == 1:
@@ -441,7 +441,7 @@ def get_swift_codename(version):
     match = re.match(r'^(\d+)\.(\d+)', version)
     if match:
         major_minor_version = match.group(0)
-        for codename, versions in six.iteritems(SWIFT_CODENAMES):
+        for codename, versions in SWIFT_CODENAMES.items():
             for release_version in versions:
                 if release_version.startswith(major_minor_version):
                     return codename
@@ -477,9 +477,7 @@ def get_os_codename_package(package, fatal=True):
     if snap_install_requested():
         cmd = ['snap', 'list', package]
         try:
-            out = subprocess.check_output(cmd)
-            if six.PY3:
-                out = out.decode('UTF-8')
+            out = subprocess.check_output(cmd).decode('UTF-8')
         except subprocess.CalledProcessError:
             return None
         lines = out.split('\n')
@@ -549,16 +547,14 @@ def get_os_version_package(pkg, fatal=True):
 
     if 'swift' in pkg:
         vers_map = SWIFT_CODENAMES
-        for cname, version in six.iteritems(vers_map):
+        for cname, version in vers_map.items():
             if cname == codename:
                 return version[-1]
     else:
         vers_map = OPENSTACK_CODENAMES
-        for version, cname in six.iteritems(vers_map):
+        for version, cname in vers_map.items():
             if cname == codename:
                 return version
-    # e = "Could not determine OpenStack version for package: %s" % pkg
-    # error_out(e)
 
 
 def get_installed_os_version():
@@ -581,7 +577,6 @@ def get_installed_os_version():
     return openstack_release().get('OPENSTACK_CODENAME')
 
 
-@cached
 def openstack_release():
     """Return /etc/os-release in a dict."""
     d = {}
@@ -821,10 +816,10 @@ def save_script_rc(script_path="scripts/scriptrc", **env_vars):
     if not os.path.exists(os.path.dirname(juju_rc_path)):
         os.mkdir(os.path.dirname(juju_rc_path))
     with open(juju_rc_path, 'wt') as rc_script:
-        rc_script.write(
-            "#!/bin/bash\n")
-        [rc_script.write('export %s=%s\n' % (u, p))
-         for u, p in six.iteritems(env_vars) if u != "script_path"]
+        rc_script.write("#!/bin/bash\n")
+        for u, p in env_vars.items():
+            if u != "script_path":
+                rc_script.write('export %s=%s\n' % (u, p))
 
 
 def openstack_upgrade_available(package):
@@ -843,14 +838,10 @@ def openstack_upgrade_available(package):
     if not cur_vers:
         # The package has not been installed yet do not attempt upgrade
         return False
-    if "swift" in package:
-        codename = get_os_codename_install_source(src)
-        avail_vers = get_os_version_codename_swift(codename)
-    else:
-        try:
-            avail_vers = get_os_version_install_source(src)
-        except Exception:
-            avail_vers = cur_vers
+    try:
+        avail_vers = get_os_version_install_source(src)
+    except Exception:
+        avail_vers = cur_vers
     apt.init()
     return apt.version_compare(avail_vers, cur_vers) >= 1
 
@@ -954,7 +945,7 @@ def os_requires_version(ostack_release, pkg):
     def wrap(f):
         @wraps(f)
         def wrapped_f(*args):
-            if os_release(pkg) < ostack_release:
+            if CompareOpenStackReleases(os_release(pkg)) < ostack_release:
                 raise Exception("This hook is not supported on releases"
                                 " before %s" % ostack_release)
             f(*args)
@@ -1039,7 +1030,7 @@ def _determine_os_workload_status(
             state, message, lambda: charm_func(configs))
 
     if state is None:
-        state, message = _ows_check_services_running(services, ports)
+        state, message = ows_check_services_running(services, ports)
 
     if state is None:
         state = 'active'
@@ -1213,12 +1204,19 @@ def _ows_check_charm_func(state, message, charm_func_with_configs):
     return state, message
 
 
+@deprecate("use ows_check_services_running() instead", "2022-05", log=juju_log)
 def _ows_check_services_running(services, ports):
+    return ows_check_services_running(services, ports)
+
+
+def ows_check_services_running(services, ports, ssl_check_info=None):
     """Check that the services that should be running are actually running
     and that any ports specified are being listened to.
 
     @param services: list of strings OR dictionary specifying services/ports
     @param ports: list of ports
+    @param ssl_check_info: SSLPortCheckInfo object. If provided, port checks
+                           will be done using an SSL connection.
     @returns state, message: strings or None, None
     """
     messages = []
@@ -1234,7 +1232,7 @@ def _ows_check_services_running(services, ports):
         # also verify that the ports that should be open are open
         # NB, that ServiceManager objects only OPTIONALLY have ports
         map_not_open, ports_open = (
-            _check_listening_on_services_ports(services))
+            _check_listening_on_services_ports(services, ssl_check_info))
         if not all(ports_open):
             # find which service has missing ports. They are in service
             # order which makes it a bit easier.
@@ -1249,7 +1247,8 @@ def _ows_check_services_running(services, ports):
 
     if ports is not None:
         # and we can also check ports which we don't know the service for
-        ports_open, ports_open_bools = _check_listening_on_ports_list(ports)
+        ports_open, ports_open_bools = \
+            _check_listening_on_ports_list(ports, ssl_check_info)
         if not all(ports_open_bools):
             messages.append(
                 "Ports which should be open, but are not: {}"
@@ -1308,7 +1307,8 @@ def _check_running_services(services):
     return list(zip(services, services_running)), services_running
 
 
-def _check_listening_on_services_ports(services, test=False):
+def _check_listening_on_services_ports(services, test=False,
+                                       ssl_check_info=None):
     """Check that the unit is actually listening (has the port open) on the
     ports that the service specifies are open. If test is True then the
     function returns the services with ports that are open rather than
@@ -1318,11 +1318,14 @@ def _check_listening_on_services_ports(services, test=False):
 
     @param services: OrderedDict(service: [port, ...], ...)
     @param test: default=False, if False, test for closed, otherwise open.
+    @param ssl_check_info: SSLPortCheckInfo object. If provided, port checks
+                           will be done using an SSL connection.
     @returns OrderedDict(service: [port-not-open, ...]...), [boolean]
     """
-    test = not(not(test))  # ensure test is True or False
+    test = not (not (test))  # ensure test is True or False
     all_ports = list(itertools.chain(*services.values()))
-    ports_states = [port_has_listener('0.0.0.0', p) for p in all_ports]
+    ports_states = [port_has_listener('0.0.0.0', p, ssl_check_info)
+                    for p in all_ports]
     map_ports = OrderedDict()
     matched_ports = [p for p, opened in zip(all_ports, ports_states)
                      if opened == test]  # essentially opened xor test
@@ -1333,16 +1336,19 @@ def _check_listening_on_services_ports(services, test=False):
     return map_ports, ports_states
 
 
-def _check_listening_on_ports_list(ports):
+def _check_listening_on_ports_list(ports, ssl_check_info=None):
     """Check that the ports list given are being listened to
 
     Returns a list of ports being listened to and a list of the
     booleans.
 
+    @param ssl_check_info: SSLPortCheckInfo object. If provided, port checks
+                           will be done using an SSL connection.
     @param ports: LIST of port numbers.
     @returns [(port_num, boolean), ...], [boolean]
     """
-    ports_open = [port_has_listener('0.0.0.0', p) for p in ports]
+    ports_open = [port_has_listener('0.0.0.0', p, ssl_check_info)
+                  for p in ports]
     return zip(ports, ports_open), ports_open
 
 
@@ -1413,45 +1419,75 @@ def incomplete_relation_data(configs, required_interfaces):
         for i in incomplete_relations}
 
 
-def do_action_openstack_upgrade(package, upgrade_callback, configs,
-                                force_upgrade=False):
+def do_action_openstack_upgrade(package, upgrade_callback, configs):
     """Perform action-managed OpenStack upgrade.
 
     Upgrades packages to the configured openstack-origin version and sets
     the corresponding action status as a result.
 
-    If the charm was installed from source we cannot upgrade it.
     For backwards compatibility a config flag (action-managed-upgrade) must
     be set for this code to run, otherwise a full service level upgrade will
     fire on config-changed.
 
-    @param package: package name for determining if upgrade available
+    @param package: package name for determining if openstack upgrade available
     @param upgrade_callback: function callback to charm's upgrade function
     @param configs: templating object derived from OSConfigRenderer class
-    @param force_upgrade: perform dist-upgrade regardless of new openstack
 
     @return: True if upgrade successful; False if upgrade failed or skipped
     """
     ret = False
 
-    if openstack_upgrade_available(package) or force_upgrade:
+    if openstack_upgrade_available(package):
         if config('action-managed-upgrade'):
             juju_log('Upgrading OpenStack release')
 
             try:
                 upgrade_callback(configs=configs)
-                action_set({'outcome': 'success, upgrade completed.'})
+                action_set({'outcome': 'success, upgrade completed'})
                 ret = True
             except Exception:
-                action_set({'outcome': 'upgrade failed, see traceback.'})
+                action_set({'outcome': 'upgrade failed, see traceback'})
                 action_set({'traceback': traceback.format_exc()})
-                action_fail('do_openstack_upgrade resulted in an '
+                action_fail('upgrade callback resulted in an '
                             'unexpected error')
         else:
             action_set({'outcome': 'action-managed-upgrade config is '
-                                   'False, skipped upgrade.'})
+                                   'False, skipped upgrade'})
     else:
-        action_set({'outcome': 'no upgrade available.'})
+        action_set({'outcome': 'no upgrade available'})
+
+    return ret
+
+
+def do_action_package_upgrade(package, upgrade_callback, configs):
+    """Perform package upgrade within the current OpenStack release.
+
+    Upgrades packages only if there is not an openstack upgrade available,
+    and sets the corresponding action status as a result.
+
+    @param package: package name for determining if openstack upgrade available
+    @param upgrade_callback: function callback to charm's upgrade function
+    @param configs: templating object derived from OSConfigRenderer class
+
+    @return: True if upgrade successful; False if upgrade failed or skipped
+    """
+    ret = False
+
+    if not openstack_upgrade_available(package):
+        juju_log('Upgrading packages')
+
+        try:
+            upgrade_callback(configs=configs)
+            action_set({'outcome': 'success, upgrade completed'})
+            ret = True
+        except Exception:
+            action_set({'outcome': 'upgrade failed, see traceback'})
+            action_set({'traceback': traceback.format_exc()})
+            action_fail('upgrade callback resulted in an '
+                        'unexpected error')
+    else:
+        action_set({'outcome': 'upgrade skipped because an openstack upgrade '
+                               'is available'})
 
     return ret
 
@@ -1546,7 +1582,7 @@ def is_unit_paused_set():
         with unitdata.HookData()() as t:
             kv = t[0]
             # transform something truth-y into a Boolean.
-            return not(not(kv.get('unit-paused')))
+            return not (not (kv.get('unit-paused')))
     except Exception:
         return False
 
@@ -1849,21 +1885,20 @@ def pausable_restart_on_change(restart_map, stopstart=False,
 
     """
     def wrap(f):
-        # py27 compatible nonlocal variable.  When py3 only, replace with
-        # nonlocal keyword
-        __restart_map_cache = {'cache': None}
+        __restart_map_cache = None
 
         @functools.wraps(f)
         def wrapped_f(*args, **kwargs):
+            nonlocal __restart_map_cache
             if is_unit_paused_set():
                 return f(*args, **kwargs)
-            if __restart_map_cache['cache'] is None:
-                __restart_map_cache['cache'] = restart_map() \
+            if __restart_map_cache is None:
+                __restart_map_cache = restart_map() \
                     if callable(restart_map) else restart_map
             # otherwise, normal restart_on_change functionality
             return restart_on_change_helper(
                 (lambda: f(*args, **kwargs)),
-                __restart_map_cache['cache'],
+                __restart_map_cache,
                 stopstart,
                 restart_functions,
                 can_restart_now_f,
@@ -1888,7 +1923,7 @@ def ordered(orderme):
         raise ValueError('argument must be a dict type')
 
     result = OrderedDict()
-    for k, v in sorted(six.iteritems(orderme), key=lambda x: x[0]):
+    for k, v in sorted(orderme.items(), key=lambda x: x[0]):
         if isinstance(v, dict):
             result[k] = ordered(v)
         else:
@@ -2145,7 +2180,7 @@ def is_unit_upgrading_set():
         with unitdata.HookData()() as t:
             kv = t[0]
             # transform something truth-y into a Boolean.
-            return not(not(kv.get('unit-upgrading')))
+            return not (not (kv.get('unit-upgrading')))
     except Exception:
         return False
 

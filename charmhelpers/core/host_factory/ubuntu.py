@@ -30,6 +30,11 @@ UBUNTU_RELEASES = (
     'hirsute',
     'impish',
     'jammy',
+    'kinetic',
+    'lunar',
+    'mantic',
+    'noble',
+    'oracular',
 )
 
 

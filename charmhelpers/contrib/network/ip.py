@@ -15,8 +15,8 @@
 import glob
 import re
 import subprocess
-import six
 import socket
+import ssl
 
 from functools import partial
 
@@ -39,20 +39,14 @@ try:
     import netifaces
 except ImportError:
     apt_update(fatal=True)
-    if six.PY2:
-        apt_install('python-netifaces', fatal=True)
-    else:
-        apt_install('python3-netifaces', fatal=True)
+    apt_install('python3-netifaces', fatal=True)
     import netifaces
 
 try:
     import netaddr
 except ImportError:
     apt_update(fatal=True)
-    if six.PY2:
-        apt_install('python-netaddr', fatal=True)
-    else:
-        apt_install('python3-netaddr', fatal=True)
+    apt_install('python3-netaddr', fatal=True)
     import netaddr
 
 
@@ -462,22 +456,19 @@ def ns_query(address):
     try:
         import dns.resolver
     except ImportError:
-        if six.PY2:
-            apt_install('python-dnspython', fatal=True)
-        else:
-            apt_install('python3-dnspython', fatal=True)
+        apt_install('python3-dnspython', fatal=True)
         import dns.resolver
 
     if isinstance(address, dns.name.Name):
         rtype = 'PTR'
-    elif isinstance(address, six.string_types):
+    elif isinstance(address, str):
         rtype = 'A'
     else:
         return None
 
     try:
         answers = dns.resolver.query(address, rtype)
-    except dns.resolver.NXDOMAIN:
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
         return None
 
     if answers:
@@ -513,10 +504,7 @@ def get_hostname(address, fqdn=True):
         try:
             import dns.reversename
         except ImportError:
-            if six.PY2:
-                apt_install("python-dnspython", fatal=True)
-            else:
-                apt_install("python3-dnspython", fatal=True)
+            apt_install("python3-dnspython", fatal=True)
             import dns.reversename
 
         rev = dns.reversename.from_address(address)
@@ -540,19 +528,56 @@ def get_hostname(address, fqdn=True):
         return result.split('.')[0]
 
 
-def port_has_listener(address, port):
+class SSLPortCheckInfo(object):
+
+    def __init__(self, key, cert, ca_cert, check_hostname=False):
+        self.key = key
+        self.cert = cert
+        self.ca_cert = ca_cert
+        # NOTE: by default we do not check hostname since the port check is
+        #       typically performed using 0.0.0.0 which will not match the
+        #       certificate. Hence the default for this is False.
+        self.check_hostname = check_hostname
+
+    @property
+    def ssl_context(self):
+        context = ssl.create_default_context()
+        context.check_hostname = self.check_hostname
+        context.load_cert_chain(self.cert, self.key)
+        context.load_verify_locations(self.ca_cert)
+        return context
+
+
+def port_has_listener(address, port, sslinfo=None):
     """
     Returns True if the address:port is open and being listened to,
-    else False.
+    else False. By default uses netcat to check ports but if sslinfo is
+    provided will use an SSL connection instead.
 
     @param address: an IP address or hostname
     @param port: integer port
+    @param sslinfo: optional SSLPortCheckInfo object.
+                    If provided, the check is performed using an ssl
+                    connection.
 
     Note calls 'zc' via a subprocess shell
     """
-    cmd = ['nc', '-z', address, str(port)]
-    result = subprocess.call(cmd)
-    return not(bool(result))
+    if not sslinfo:
+        cmd = ['nc', '-z', address, str(port)]
+        result = subprocess.call(cmd)
+        return not (bool(result))
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0) as sock:
+            ssock = sslinfo.ssl_context.wrap_socket(sock,
+                                                    server_hostname=address)
+            ssock.connect((address, port))
+            # this bit is crucial to ensure tls close_notify is sent
+            ssock.unwrap()
+
+        return True
+    except ConnectionRefusedError:
+        return False
 
 
 def assert_charm_supports_ipv6():
