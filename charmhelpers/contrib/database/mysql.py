@@ -11,13 +11,14 @@
 # limitations under the License.
 
 """Helper for working with a MySQL database"""
+import collections
+import copy
 import json
 import re
 import sys
 import platform
 import os
 import glob
-import six
 
 # from string import upper
 
@@ -35,6 +36,7 @@ from charmhelpers.core.hookenv import (
     unit_get,
     log,
     DEBUG,
+    ERROR,
     INFO,
     WARNING,
     leader_get,
@@ -52,10 +54,7 @@ try:
     import MySQLdb
 except ImportError:
     apt_update(fatal=True)
-    if six.PY2:
-        apt_install(filter_installed_packages(['python-mysqldb']), fatal=True)
-    else:
-        apt_install(filter_installed_packages(['python3-mysqldb']), fatal=True)
+    apt_install(filter_installed_packages(['python3-mysqldb']), fatal=True)
     import MySQLdb
 
 
@@ -67,8 +66,15 @@ class MySQLHelper(object):
 
     def __init__(self, rpasswdf_template, upasswdf_template, host='localhost',
                  migrate_passwd_to_leader_storage=True,
-                 delete_ondisk_passwd_file=True):
+                 delete_ondisk_passwd_file=True, user="root", password=None,
+                 port=None, connect_timeout=None):
+        self.user = user
         self.host = host
+        self.password = password
+        self.port = port
+        # default timeout of 30 seconds.
+        self.connect_timeout = connect_timeout or 30
+
         # Password file path templates
         self.root_passwd_file_template = rpasswdf_template
         self.user_passwd_file_template = upasswdf_template
@@ -78,10 +84,31 @@ class MySQLHelper(object):
         self.delete_ondisk_passwd_file = delete_ondisk_passwd_file
         self.connection = None
 
-    def connect(self, user='root', password=None):
-        log("Opening db connection for %s@%s" % (user, self.host), level=DEBUG)
-        self.connection = MySQLdb.connect(user=user, host=self.host,
-                                          passwd=password)
+    def connect(self, user='root', password=None, host=None, port=None,
+                connect_timeout=None):
+        _connection_info = {
+            "user": user or self.user,
+            "passwd": password or self.password,
+            "host": host or self.host
+        }
+        # set the connection timeout; for mysql8 it can hang forever, so some
+        # timeout is required.
+        timeout = connect_timeout or self.connect_timeout
+        if timeout:
+            _connection_info["connect_timeout"] = timeout
+        # port cannot be None but we also do not want to specify it unless it
+        # has been explicit set.
+        port = port or self.port
+        if port is not None:
+            _connection_info["port"] = port
+
+        log("Opening db connection for %s@%s" % (user, host), level=DEBUG)
+        try:
+            self.connection = MySQLdb.connect(**_connection_info)
+        except Exception as e:
+            log("Failed to connect to database due to '{}'".format(str(e)),
+                level=ERROR)
+            raise
 
     def database_exists(self, db_name):
         cursor = self.connection.cursor()
@@ -156,12 +183,31 @@ class MySQLHelper(object):
             cursor.close()
 
     def execute(self, sql):
-        """Execute arbitary SQL against the database."""
+        """Execute arbitrary SQL against the database."""
         cursor = self.connection.cursor()
         try:
             cursor.execute(sql)
         finally:
             cursor.close()
+
+    def select(self, sql):
+        """
+        Execute arbitrary SQL select query against the database
+        and return the results.
+
+        :param sql: SQL select query to execute
+        :type sql: string
+        :returns: SQL select query result
+        :rtype: list of lists
+        :raises: MySQLdb.Error
+        """
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(sql)
+            results = [list(i) for i in cursor.fetchall()]
+        finally:
+            cursor.close()
+        return results
 
     def migrate_passwords_to_leader_storage(self, excludes=None):
         """Migrate any passwords storage on disk to leader storage."""
@@ -275,11 +321,18 @@ class MySQLHelper(object):
         """Retrieve or generate mysql root password for service units."""
         return self.get_mysql_password(username=None, password=password)
 
-    def set_mysql_password(self, username, password):
+    def set_mysql_password(self, username, password, current_password=None):
         """Update a mysql password for the provided username changing the
         leader settings
 
         To update root's password pass `None` in the username
+
+        :param username: Username to change password of
+        :type username: str
+        :param password: New password for user.
+        :type password: str
+        :param current_password: Existing password for user.
+        :type current_password: str
         """
 
         if username is None:
@@ -289,21 +342,72 @@ class MySQLHelper(object):
         # changes to root-password were not supported) the user changed the
         # password, so leader-get is more reliable source than
         # config.previous('root-password').
-        rel_username = None if username == 'root' else username
-        cur_passwd = self.get_mysql_password(rel_username)
+        if not current_password:
+            current_password = self.get_mysql_password(
+                None if username == 'root' else username)
 
         # password that needs to be set
         new_passwd = password
 
         # update password for all users (e.g. root@localhost, root@::1, etc)
         try:
-            self.connect(user=username, password=cur_passwd)
-            cursor = self.connection.cursor()
+            self.connect(user=username, password=current_password)
         except MySQLdb.OperationalError as ex:
             raise MySQLSetPasswordError(('Cannot connect using password in '
                                          'leader settings (%s)') % ex, ex)
+        self.set_mysql_password_using_current_connection(
+            username, new_passwd)
 
+    def set_mysql_password_using_current_connection(
+            self, username, new_passwd, hosts=None):
+        """Update a mysql password using the current connection.
+
+        Update the password for a username using the current connection in
+        `self.connection`.  It is expected that the connect is a root
+        connection that can change the password for any user.  The leader
+        settings (if the unit is the leader) are also changed to match the
+        password in the database.
+
+        Note: passwords have to be changed on each mysql unit as they are not
+        propagated using replication in clusters.
+
+        :param username: the username to change the password for.
+        :type username: str
+        :param new_passwd: the new password for the user.
+        :type new_passwd: str
+        :param hosts: optional list of hosts.
+        :type hosts: Optional[List[str]]
+        :raises MySQLSetPasswordError: if the password can't be changed.
+        """
+        # update the password using the self.connection
+        self._update_password(username, new_passwd, hosts=hosts)
+
+        # check the password was changed, only if it is local (i.e. no hosts
+        # are assigned) as otherwise this will fail.
+        if not hosts:
+            self._check_user_can_connect(username, new_passwd)
+
+        # Update the leader settings (if leader) with the new password.
+        # It's a no-op on a non-leader
+        self._update_leader_settings(username, new_passwd)
+
+    def _update_password(self, username, new_passwd, hosts=None):
+        """Update the password for a user using the existing self.connection
+
+        :param username: the user to connect for
+        :type username: str
+        :param password: the password to use.
+        :type password: str
+        :param hosts: optional list of hosts.
+        :type hosts: Optional[List[str]]
+        :raises MySQLSetPasswordError: if the user can't connect.
+        """
+        if not hosts:
+            hosts = None
+        user_sub = "%s" if hosts is None else "%s@%s"
+        cursor = None
         try:
+            cursor = self.connection.cursor()
             # NOTE(freyes): Due to skip-name-resolve root@$HOSTNAME account
             # fails when using SET PASSWORD so using UPDATE against the
             # mysql.user table is needed, but changes to this table are not
@@ -313,43 +417,80 @@ class MySQLHelper(object):
             release = CompareHostReleases(lsb_release()['DISTRIB_CODENAME'])
             if release < 'bionic':
                 SQL_UPDATE_PASSWD = ("UPDATE mysql.user SET password = "
-                                     "PASSWORD( %s ) WHERE user = %s;")
+                                     "PASSWORD( %s ) WHERE user = {};"
+                                     .format(user_sub))
             else:
                 # PXC 5.7 (introduced in Bionic) uses authentication_string
                 SQL_UPDATE_PASSWD = ("UPDATE mysql.user SET "
                                      "authentication_string = "
-                                     "PASSWORD( %s ) WHERE user = %s;")
-            cursor.execute(SQL_UPDATE_PASSWD, (new_passwd, username))
+                                     "PASSWORD( %s ) WHERE user = {};"
+                                     .format(user_sub))
+            if hosts is None:
+                cursor.execute(SQL_UPDATE_PASSWD, (new_passwd, username))
+            else:
+                for host in hosts:
+                    cursor.execute(SQL_UPDATE_PASSWD,
+                                   (new_passwd, username, host))
             cursor.execute('FLUSH PRIVILEGES;')
             self.connection.commit()
         except MySQLdb.OperationalError as ex:
             raise MySQLSetPasswordError('Cannot update password: %s' % str(ex),
                                         ex)
         finally:
-            cursor.close()
+            if cursor is not None:
+                cursor.close()
 
-        # check the password was changed
+    def _check_user_can_connect(self, username, password):
+        """Verify that a user can connect using a password.
+
+        :param username: the user to connect for
+        :type username: str
+        :param password: the password to use.
+        :type password: str
+        :raises MySQLSetPasswordError: if the user can't connect.
+        """
         try:
-            self.connect(user=username, password=new_passwd)
+            self.connect(user=username, password=password)
             self.execute('select 1;')
         except MySQLdb.OperationalError as ex:
             raise MySQLSetPasswordError(('Cannot connect using new password: '
                                          '%s') % str(ex), ex)
 
+    def _update_leader_settings(self, username, password):
+        """Update the leader settings for the username & password.
+
+        This is a no-op if not the leader.  If the username hasn't previous had
+        the password set, then this does not store the new password.
+
+        :param username: the user to connect for
+        :type username: str
+        :param password: the password to use.
+        :type password: str
+        """
         if not is_leader():
             log('Only the leader can set a new password in the relation',
                 level=DEBUG)
             return
 
-        for key in self.passwd_keys(rel_username):
+        for key in self.passwd_keys(None if username == 'root' else username):
             _password = leader_get(key)
             if _password:
-                log('Updating password for %s (%s)' % (key, rel_username),
+                log('Updating password for %s (%s)' % (key, username),
                     level=DEBUG)
-                leader_set(settings={key: new_passwd})
+                leader_set(settings={key: password})
 
-    def set_mysql_root_password(self, password):
-        self.set_mysql_password('root', password)
+    def set_mysql_root_password(self, password, current_password=None):
+        """Update mysql root password changing the leader settings
+
+        :param password: New password for user.
+        :type password: str
+        :param current_password: Existing password for user.
+        :type current_password: str
+        """
+        self.set_mysql_password(
+            'root',
+            password,
+            current_password=current_password)
 
     def normalize_address(self, hostname):
         """Ensure that address returned is an IP address (i.e. not fqdn)"""
@@ -363,18 +504,21 @@ class MySQLHelper(object):
         # Otherwise assume localhost
         return '127.0.0.1'
 
-    def get_allowed_units(self, database, username, relation_id=None):
+    def get_allowed_units(self, database, username, relation_id=None, prefix=None):
         """Get list of units with access grants for database with username.
 
         This is typically used to provide shared-db relations with a list of
         which units have been granted access to the given database.
         """
-        self.connect(password=self.get_mysql_root_password())
+        if not self.connection:
+            self.connect(password=self.get_mysql_root_password())
         allowed_units = set()
+        if not prefix:
+            prefix = database
         for unit in related_units(relation_id):
             settings = relation_get(rid=relation_id, unit=unit)
             # First check for setting with prefix, then without
-            for attr in ["%s_hostname" % (database), 'hostname']:
+            for attr in ["%s_hostname" % (prefix), 'hostname']:
                 hosts = settings.get(attr, None)
                 if hosts:
                     break
@@ -406,7 +550,8 @@ class MySQLHelper(object):
 
     def configure_db(self, hostname, database, username, admin=False):
         """Configure access to database for username from hostname."""
-        self.connect(password=self.get_mysql_root_password())
+        if not self.connection:
+            self.connect(password=self.get_mysql_root_password())
         if not self.database_exists(database):
             self.create_database(database)
 
@@ -422,7 +567,20 @@ class MySQLHelper(object):
         return password
 
 
-class PerconaClusterHelper(object):
+# `_singleton_config_helper` stores the instance of the helper class that is
+# being used during a hook invocation.
+_singleton_config_helper = None
+
+
+def get_mysql_config_helper():
+    global _singleton_config_helper
+    if _singleton_config_helper is None:
+        _singleton_config_helper = MySQLConfigHelper()
+    return _singleton_config_helper
+
+
+class MySQLConfigHelper(object):
+    """Base configuration helper for MySQL."""
 
     # Going for the biggest page size to avoid wasted bytes.
     # InnoDB page size is 16MB
@@ -498,36 +656,49 @@ class PerconaClusterHelper(object):
                     mtot, modifier = mem.strip().split(' ')
                     return '%s%s' % (mtot, modifier[0].upper())
 
-    def parse_config(self):
-        """Parse charm configuration and calculate values for config files."""
-        config = config_get()
-        mysql_config = {}
-        if 'max-connections' in config:
-            mysql_config['max_connections'] = config['max-connections']
+    def get_innodb_flush_log_at_trx_commit(self):
+        """Get value for innodb_flush_log_at_trx_commit.
 
-        if 'wait-timeout' in config:
-            mysql_config['wait_timeout'] = config['wait-timeout']
+        Use the innodb-flush-log-at-trx-commit or the tunning-level setting
+        translated by INNODB_FLUSH_CONFIG_VALUES to get the
+        innodb_flush_log_at_trx_commit value.
 
-        if 'innodb-flush-log-at-trx-commit' in config:
-            mysql_config['innodb_flush_log_at_trx_commit'] = \
-                config['innodb-flush-log-at-trx-commit']
-        elif 'tuning-level' in config:
-            mysql_config['innodb_flush_log_at_trx_commit'] = \
-                self.INNODB_FLUSH_CONFIG_VALUES.get(config['tuning-level'], 1)
+        :returns: Numeric value for innodb_flush_log_at_trx_commit
+        :rtype: Union[None, int]
+        """
+        _iflatc = config_get('innodb-flush-log-at-trx-commit')
+        _tuning_level = config_get('tuning-level')
+        if _iflatc:
+            return _iflatc
+        elif _tuning_level:
+            return self.INNODB_FLUSH_CONFIG_VALUES.get(_tuning_level, 1)
 
-        if ('innodb-change-buffering' in config and
-                config['innodb-change-buffering'] in self.INNODB_VALID_BUFFERING_VALUES):
-            mysql_config['innodb_change_buffering'] = config['innodb-change-buffering']
+    def get_innodb_change_buffering(self):
+        """Get value for innodb_change_buffering.
 
-        if 'innodb-io-capacity' in config:
-            mysql_config['innodb_io_capacity'] = config['innodb-io-capacity']
+        Use the innodb-change-buffering validated against
+        INNODB_VALID_BUFFERING_VALUES to get the innodb_change_buffering value.
 
-        # Set a sane default key_buffer size
-        mysql_config['key_buffer'] = self.human_to_bytes('32M')
+        :returns: String value for innodb_change_buffering.
+        :rtype: Union[None, str]
+        """
+        _icb = config_get('innodb-change-buffering')
+        if _icb and _icb in self.INNODB_VALID_BUFFERING_VALUES:
+            return _icb
+
+    def get_innodb_buffer_pool_size(self):
+        """Get value for innodb_buffer_pool_size.
+
+        Return the number value of innodb-buffer-pool-size or dataset-size. If
+        neither is set, calculate a sane default based on total memory.
+
+        :returns: Numeric value for innodb_buffer_pool_size.
+        :rtype: int
+        """
         total_memory = self.human_to_bytes(self.get_mem_total())
 
-        dataset_bytes = config.get('dataset-size', None)
-        innodb_buffer_pool_size = config.get('innodb-buffer-pool-size', None)
+        dataset_bytes = config_get('dataset-size')
+        innodb_buffer_pool_size = config_get('innodb-buffer-pool-size')
 
         if innodb_buffer_pool_size:
             innodb_buffer_pool_size = self.human_to_bytes(
@@ -552,5 +723,262 @@ class PerconaClusterHelper(object):
                 innodb_buffer_pool_size,
                 total_memory), level='WARN')
 
-        mysql_config['innodb_buffer_pool_size'] = innodb_buffer_pool_size
+        return innodb_buffer_pool_size
+
+    def get_group_replication_message_cache_size(self):
+        """Get value for group_replication_message_cache_size.
+
+        :returns: Numeric value for group_replication_message_cache_size
+                  None if not set.
+        :rtype: Union[None, int]
+        """
+        gr_message_cache_size = config_get('group-replication-message-cache-size')
+        if gr_message_cache_size:
+            return self.human_to_bytes(gr_message_cache_size)
+
+
+class PerconaClusterHelper(MySQLConfigHelper):
+    """Percona-cluster specific configuration helper."""
+
+    def parse_config(self):
+        """Parse charm configuration and calculate values for config files."""
+        config = config_get()
+        mysql_config = {}
+        if 'max-connections' in config:
+            mysql_config['max_connections'] = config['max-connections']
+
+        if 'wait-timeout' in config:
+            mysql_config['wait_timeout'] = config['wait-timeout']
+
+        if self.get_innodb_flush_log_at_trx_commit() is not None:
+            mysql_config['innodb_flush_log_at_trx_commit'] = \
+                self.get_innodb_flush_log_at_trx_commit()
+
+        if self.get_innodb_change_buffering() is not None:
+            mysql_config['innodb_change_buffering'] = config['innodb-change-buffering']
+
+        if 'innodb-io-capacity' in config:
+            mysql_config['innodb_io_capacity'] = config['innodb-io-capacity']
+
+        # Set a sane default key_buffer size
+        mysql_config['key_buffer'] = self.human_to_bytes('32M')
+        mysql_config['innodb_buffer_pool_size'] = self.get_innodb_buffer_pool_size()
         return mysql_config
+
+
+class MySQL8Helper(MySQLHelper):
+
+    def grant_exists(self, db_name, db_user, remote_ip):
+        cursor = self.connection.cursor()
+        priv_string = ("GRANT ALL PRIVILEGES ON {}.* "
+                       "TO {}@{}".format(db_name, db_user, remote_ip))
+        try:
+            cursor.execute("SHOW GRANTS FOR '{}'@'{}'".format(db_user,
+                                                              remote_ip))
+            grants = [i[0] for i in cursor.fetchall()]
+        except MySQLdb.OperationalError:
+            return False
+        finally:
+            cursor.close()
+
+        # Different versions of MySQL use ' or `. Ignore these in the check.
+        return priv_string in [
+            i.replace("'", "").replace("`", "") for i in grants]
+
+    def create_grant(self, db_name, db_user, remote_ip, password):
+        if self.grant_exists(db_name, db_user, remote_ip):
+            return
+
+        # Make sure the user exists
+        # MySQL8 must create the user before the grant
+        self.create_user(db_user, remote_ip, password)
+
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("GRANT ALL PRIVILEGES ON `{}`.* TO '{}'@'{}'"
+                           .format(db_name, db_user, remote_ip))
+        finally:
+            cursor.close()
+
+    def user_host_list(self):
+        """Return a list of (user, host) tuples from the database.
+
+        This requires that self.connection has the permissions to perform the
+        action.
+
+        :returns: list of (user, host) tuples.
+        :rtype: List[Tuple[str, str]]
+        """
+        SQL_USER_LIST = "SELECT user, host from mysql.user"
+
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(SQL_USER_LIST)
+            return [(i[0], i[1]) for i in cursor.fetchall()]
+        except MySQLdb.OperationalError as e:
+            log("Couldn't return user list: reason {}".format(str(e)),
+                "WARNING")
+        finally:
+            cursor.close()
+        return []
+
+    def create_user(self, db_user, remote_ip, password):
+
+        SQL_USER_CREATE = (
+            "CREATE USER '{db_user}'@'{remote_ip}' "
+            "IDENTIFIED BY '{password}'")
+
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(SQL_USER_CREATE.format(
+                db_user=db_user,
+                remote_ip=remote_ip,
+                password=password)
+            )
+        except MySQLdb.OperationalError:
+            log("DB user {} already exists.".format(db_user),
+                "WARNING")
+        finally:
+            cursor.close()
+
+    def _update_password(self, username, new_passwd, hosts=None):
+        """Update the password for a user using the existing self.connection
+
+        :param username: the user to connect for
+        :type username: str
+        :param password: the password to use.
+        :type password: str
+        :param hosts: optional list of hosts.
+        :type hosts: Optional[List[str]]
+        :raises MySQLSetPasswordError: if the user can't connect.
+        """
+        if not hosts:
+            hosts = None
+        user_sub = "%s" if hosts is None else "%s@%s"
+        cursor = None
+        try:
+            cursor = self.connection.cursor()
+            SQL_UPDATE_PASSWD = ("ALTER USER {} IDENTIFIED BY %s;"
+                                 .format(user_sub))
+            if hosts is None:
+                log("Updating password for username: {}".format(username),
+                    "DEBUG")
+                cursor.execute(SQL_UPDATE_PASSWD, (username, new_passwd))
+            else:
+                for host in hosts:
+                    log("Updating password for username: {}".format(username),
+                        "DEBUG")
+                    cursor.execute(SQL_UPDATE_PASSWD,
+                                   (username, host, new_passwd))
+            cursor.execute('FLUSH PRIVILEGES;')
+            self.connection.commit()
+        except MySQLdb.OperationalError as ex:
+            raise MySQLSetPasswordError('Cannot update password: %s' % str(ex),
+                                        ex)
+        finally:
+            if cursor is not None:
+                cursor.close()
+
+    def create_router_grant(self, db_user, remote_ip, password):
+
+        # Make sure the user exists
+        # MySQL8 must create the user before the grant
+        self.create_user(db_user, remote_ip, password)
+
+        # Mysql-Router specific grants
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("GRANT CREATE USER ON *.* TO '{}'@'{}' WITH GRANT "
+                           "OPTION".format(db_user, remote_ip))
+            cursor.execute("GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE ON "
+                           "mysql_innodb_cluster_metadata.* TO '{}'@'{}'"
+                           .format(db_user, remote_ip))
+            cursor.execute("GRANT SELECT ON mysql.user TO '{}'@'{}'"
+                           .format(db_user, remote_ip))
+            cursor.execute("GRANT SELECT ON "
+                           "performance_schema.replication_group_members "
+                           "TO '{}'@'{}'".format(db_user, remote_ip))
+            cursor.execute("GRANT SELECT ON "
+                           "performance_schema.replication_group_member_stats "
+                           "TO '{}'@'{}'".format(db_user, remote_ip))
+            cursor.execute("GRANT SELECT ON "
+                           "performance_schema.global_variables "
+                           "TO '{}'@'{}'".format(db_user, remote_ip))
+        finally:
+            cursor.close()
+
+    def configure_router(self, hostname, username):
+
+        if self.connection is None:
+            self.connect(password=self.get_mysql_root_password())
+
+        remote_ip = self.normalize_address(hostname)
+        password = self.get_mysql_password(username)
+        self.create_user(username, remote_ip, password)
+        self.create_router_grant(username, remote_ip, password)
+
+        return password
+
+
+def get_prefix(requested, keys=None):
+    """Return existing prefix or None.
+
+    :param requested: Request string. i.e. novacell0_username
+    :type requested: str
+    :param keys: Keys to determine prefix. Defaults set in function.
+    :type keys: List of str keys
+    :returns: String prefix i.e. novacell0
+    :rtype: Union[None, str]
+    """
+    if keys is None:
+        # Shared-DB default keys
+        keys = ["_database", "_username", "_hostname"]
+    for key in keys:
+        if requested.endswith(key):
+            return requested[:-len(key)]
+
+
+def get_db_data(relation_data, unprefixed):
+    """Organize database requests into a collections.OrderedDict
+
+    :param relation_data: shared-db relation data
+    :type relation_data: dict
+    :param unprefixed: Prefix to use for requests without a prefix. This should
+                       be unique for each side of the relation to avoid
+                       conflicts.
+    :type unprefixed: str
+    :returns: Order dict of databases and users
+    :rtype: collections.OrderedDict
+    """
+    # Deep copy to avoid unintentionally changing relation data
+    settings = copy.deepcopy(relation_data)
+    databases = collections.OrderedDict()
+
+    # Clear non-db related elements
+    if "egress-subnets" in settings.keys():
+        settings.pop("egress-subnets")
+    if "ingress-address" in settings.keys():
+        settings.pop("ingress-address")
+    if "private-address" in settings.keys():
+        settings.pop("private-address")
+
+    singleset = {"database", "username", "hostname"}
+    if singleset.issubset(settings):
+        settings["{}_{}".format(unprefixed, "hostname")] = (
+            settings["hostname"])
+        settings.pop("hostname")
+        settings["{}_{}".format(unprefixed, "database")] = (
+            settings["database"])
+        settings.pop("database")
+        settings["{}_{}".format(unprefixed, "username")] = (
+            settings["username"])
+        settings.pop("username")
+
+    for k, v in settings.items():
+        db = k.split("_")[0]
+        x = "_".join(k.split("_")[1:])
+        if db not in databases:
+            databases[db] = collections.OrderedDict()
+        databases[db][x] = v
+
+    return databases

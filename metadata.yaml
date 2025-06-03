@@ -6,12 +6,9 @@ description: |
   compatible alternative implemented using the Galera
   synchronous replication extensions.
 tags:
-  - databases
+- databases
 series:
-  - xenial
-  - bionic
-  - artful
-  - trusty
+- bionic
 extra-bindings:
   access:
 provides:
@@ -24,6 +21,8 @@ provides:
   nrpe-external-master:
     interface: nrpe-external-master
     scope: container
+  master:
+    interface: mysql-async-replication
 peers:
   cluster:
     interface: percona-cluster
@@ -31,3 +30,5 @@ requires:
   ha:
     interface: hacluster
     scope: container
+  slave:
+    interface: mysql-async-replication

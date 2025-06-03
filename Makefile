@@ -1,5 +1,5 @@
 #!/usr/bin/make
-PYTHON := /usr/bin/env python
+PYTHON := /usr/bin/env python3
 export PYTHONPATH := hooks
 
 lint:
@@ -10,8 +10,8 @@ test:
 	@tox -e py27
 
 functional_test:
-	@echo Starting amulet tests...
-	@tox -e func27
+	@echo Starting Zaza functional tests...
+	@tox -e func
 
 bin/charm_helpers_sync.py:
 	@mkdir -p bin
@@ -20,7 +20,6 @@ bin/charm_helpers_sync.py:
 
 sync: bin/charm_helpers_sync.py
 	@$(PYTHON) bin/charm_helpers_sync.py -c charm-helpers-hooks.yaml
-	@$(PYTHON) bin/charm_helpers_sync.py -c charm-helpers-tests.yaml
 
 publish: lint test
 	bzr push lp:charms/trusty/percona-cluster

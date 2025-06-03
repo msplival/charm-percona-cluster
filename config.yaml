@@ -177,13 +177,12 @@ options:
     description: |
       Default multicast port number that will be used to communicate between HA
       Cluster nodes.
-  lp1366997-workaround:
+  use-syslog:
     type: boolean
     default: False
     description: |
-      Adds two config options (wsrep_drupal_282555_workaround and
-      wsrep_retry_autocommit) as a workaround for Percona Primary Key bug (see
-      LP 1366997). Only required for Trusty.
+      Uses syslog instead of the default error log file (/var/log/mysql/error.log).
+      Setting this to True will allow MySQL service to log to syslog.
   enable-binlogs:
     type: boolean
     default: False
@@ -227,6 +226,16 @@ options:
       implication of this is one can set configuration values that could lead
       to memory exhaustion during run time as memory is not allocated at
       startup time.
+  pxc-strict-mode:
+    type: string
+    default: enforcing
+    description: |
+      Configures pxc_strict_mode (https://www.percona.com/doc/percona-xtradb-cluster/LATEST/features/pxc-strict-mode.html)
+      Valid values are 'disabled', 'permissive', 'enforcing' and 'master.'
+      Defaults to 'enforcing', as this is what PXC5.7 on bionic (and above)
+      does.
+      This option is ignored on PXC < 5.7 (xenial defaults to 5.6, trusty
+      defaults to 5.5)
   tuning-level:
     type: string
     default: safest
@@ -317,4 +326,58 @@ options:
         For very busy clouds or in resource restricted environments this value can be changed.
         WARNING Please read all documentation before changing the default value which may have
         unintended consequences. It may be necessary to set this value higher during deploy time
-        (PTS15) and subsequently change it back to the default (PT3S) after deployment.
+        (PT15S) and subsequently change it back to the default (PT3S) after deployment.
+  databases-to-replicate:
+    type: string
+    default:
+    description: |
+      Databases and tables to replicate using MySQL asynchronous replication.
+      The databases should be separated with a semicolon while the tables
+      should be separated with a comma. No tables mean that the whole database
+      will be replicated. For example "database1:table1,table2;database2"
+      will replicate "table1" and "table2" tables from "database1" databasae
+      and all tables from "database2" database.
+      .
+      NOTE: This option should be used only when relating one cluster to the
+      other. It does not affect Galera synchronous replication.
+  cluster-id:
+    type: int
+    default:
+    description: |
+      Cluster ID to be used when using MySQL asynchronous replication.
+      .
+      NOTE: This value must be different for each cluster.
+  wsrep-slave-threads:
+    type: int
+    default:
+    description: |
+      Specifies the number of threads that can apply replication transactions
+      in parallel. Galera supports true parallel replication that applies
+      transactions in parallel only when it is safe to do so. When unset
+      defaults to 48 for >= Bionic or 1 for <= Xenial.
+  gcs-fc-limit:
+    type: int
+    default:
+    description: |
+      This setting controls when flow control engages. Simply speaking, if the
+      wsrep_local_recv_queue exceeds this size on a given node, a pausing flow
+      control message will be sent.  The fc_limit defaults to 16 transactions.
+      This effectively means that this is as far as a given node can be behind
+      committing transactions from the cluster.
+  nrpe-threads-connected:
+    type: string
+    default: '80,90'
+    description: |
+      This configuration option represents the warning and critical percentages
+      that are used to check the number of threads connected to MySQL.
+      The value should be written as a string containing two numbers separated by commas.
+  max-connect-errors:
+    type: int
+    default: 100
+    description: |
+      This setting limits the number of successive unsuccessful connection
+      requests that a host can make to MySQL. After max-connect-errors
+      successive connection requests from a host are interrupted without a
+      successful connection, the MySQL server blocks that host from making
+      further connections.
+      This setting is only for Ubuntu Xenial and newer releases.

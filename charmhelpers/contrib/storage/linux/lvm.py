@@ -1,4 +1,4 @@
-# Copyright 2014-2015 Canonical Limited.
+# Copyright 2014-2021 Canonical Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,8 +17,6 @@ from subprocess import (
     CalledProcessError,
     check_call,
     check_output,
-    Popen,
-    PIPE,
 )
 
 
@@ -27,7 +25,7 @@ from subprocess import (
 ##################################################
 def deactivate_lvm_volume_group(block_device):
     '''
-    Deactivate any volume gruop associated with an LVM physical volume.
+    Deactivate any volume group associated with an LVM physical volume.
 
     :param block_device: str: Full path to LVM physical volume
     '''
@@ -58,9 +56,7 @@ def remove_lvm_physical_volume(block_device):
 
     :param block_device: str: Full path of block device to scrub.
     '''
-    p = Popen(['pvremove', '-ff', block_device],
-              stdin=PIPE)
-    p.communicate(input='y\n')
+    check_call(['pvremove', '-ff', '--yes', block_device])
 
 
 def list_lvm_volume_group(block_device):
@@ -151,3 +147,32 @@ def extend_logical_volume_by_device(lv_name, block_device):
     '''
     cmd = ['lvextend', lv_name, block_device]
     check_call(cmd)
+
+
+def create_logical_volume(lv_name, volume_group, size=None):
+    '''
+    Create a new logical volume in an existing volume group
+
+    :param lv_name: str: name of logical volume to be created.
+    :param volume_group: str: Name of volume group to use for the new volume.
+    :param size: str: Size of logical volume to create (100% if not supplied)
+    :raises subprocess.CalledProcessError: in the event that the lvcreate fails.
+    '''
+    if size:
+        check_call([
+            'lvcreate',
+            '--yes',
+            '-L',
+            '{}'.format(size),
+            '-n', lv_name, volume_group
+        ])
+    # create the lv with all the space available, this is needed because the
+    # system call is different for LVM
+    else:
+        check_call([
+            'lvcreate',
+            '--yes',
+            '-l',
+            '100%FREE',
+            '-n', lv_name, volume_group
+        ])

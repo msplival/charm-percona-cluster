@@ -1,18 +1,22 @@
-# Bootstrap the model if necessary.
-bootstrap: True
-# Re-use bootstrap node.
-reset: True
-# Use tox/requirements to drive the venv instead of bundletester's venv feature.
-virtualenv: False
-# Leave makefile empty, otherwise unit/lint tests will rerun ahead of amulet.
-makefile: []
-# Do not specify juju PPA sources.  Juju is presumed to be pre-installed
-# and configured in all test runner environments.
-#sources:
-# Do not specify or rely on system packages.
-#packages:
-# Do not specify python packages here.  Use test-requirements.txt
-# and tox instead.  ie. The venv is constructed before bundletester
-# is invoked.
-#python-packages:
-reset_timeout: 600
+charm_name: "percona-cluster"
+tests:
+ - bionic_model:
+   - zaza.openstack.charm_tests.mysql.tests.PerconaClusterColdStartTest
+   - zaza.openstack.charm_tests.mysql.tests.PerconaClusterCharmTests
+   - zaza.openstack.charm_tests.mysql.tests.PerconaClusterScaleTests
+ - xenial_series_upgrade_model:
+   - zaza.openstack.charm_tests.series_upgrade.tests.XenialBionicSeriesUpgrade
+configure:
+  - zaza.model.block_until_all_units_idle
+target_deploy_status:
+gate_bundles:
+  - bionic_model: bionic-ha
+smoke_bundles:
+  - bionic_model: bionic-ha
+dev_bundles:
+  - xenial_series_upgrade_model: xenial-queens-ha-series-upgrade
+  - bionic_model: bionic-nagios
+  - bionic_model: bionic-nagios-ha
+tests_options:
+  force_deploy:
+    - xenial-queens-ha-series-upgrade

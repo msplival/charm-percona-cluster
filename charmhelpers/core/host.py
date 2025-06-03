@@ -1,4 +1,4 @@
-# Copyright 2014-2015 Canonical Limited.
+# Copyright 2014-2021 Canonical Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 #  Nick Moffitt <nick.moffitt@canonical.com>
 #  Matthew Wedgwood <matthew.wedgwood@canonical.com>
 
+import errno
 import os
 import re
 import pwd
@@ -30,25 +31,26 @@ import subprocess
 import hashlib
 import functools
 import itertools
-import six
 
 from contextlib import contextmanager
-from collections import OrderedDict
-from .hookenv import log, DEBUG, local_unit
+from collections import OrderedDict, defaultdict
+from .hookenv import log, INFO, DEBUG, local_unit, charm_name
 from .fstab import Fstab
 from charmhelpers.osplatform import get_platform
 
 __platform__ = get_platform()
 if __platform__ == "ubuntu":
-    from charmhelpers.core.host_factory.ubuntu import (
+    from charmhelpers.core.host_factory.ubuntu import (  # NOQA:F401
         service_available,
         add_new_group,
         lsb_release,
         cmp_pkgrevno,
         CompareHostReleases,
+        get_distrib_codename,
+        arch
     )  # flake8: noqa -- ignore F401 for this import
 elif __platform__ == "centos":
-    from charmhelpers.core.host_factory.centos import (
+    from charmhelpers.core.host_factory.centos import (  # NOQA:F401
         service_available,
         add_new_group,
         lsb_release,
@@ -57,6 +59,8 @@ elif __platform__ == "centos":
     )  # flake8: noqa -- ignore F401 for this import
 
 UPDATEDB_PATH = '/etc/updatedb.conf'
+CA_CERT_DIR = '/usr/local/share/ca-certificates'
+
 
 def service_start(service_name, **kwargs):
     """Start a system service.
@@ -110,6 +114,33 @@ def service_stop(service_name, **kwargs):
     return service('stop', service_name, **kwargs)
 
 
+def service_enable(service_name, **kwargs):
+    """Enable a system service.
+
+    The specified service name is managed via the system level init system.
+    Some init systems (e.g. upstart) require that additional arguments be
+    provided in order to directly control service instances whereas other init
+    systems allow for addressing instances of a service directly by name (e.g.
+    systemd).
+
+    The kwargs allow for the additional parameters to be passed to underlying
+    init systems for those systems which require/allow for them. For example,
+    the ceph-osd upstart script requires the id parameter to be passed along
+    in order to identify which running daemon should be restarted. The follow-
+    ing example restarts the ceph-osd service for instance id=4:
+
+    service_enable('ceph-osd', id=4)
+
+    :param service_name: the name of the service to enable
+    :param **kwargs: additional parameters to pass to the init system when
+                     managing services. These will be passed as key=value
+                     parameters to the init system's commandline. kwargs
+                     are ignored for init systems not allowing additional
+                     parameters via the commandline (systemd).
+    """
+    return service('enable', service_name, **kwargs)
+
+
 def service_restart(service_name, **kwargs):
     """Restart a system service.
 
@@ -130,7 +161,7 @@ def service_restart(service_name, **kwargs):
     :param service_name: the name of the service to restart
     :param **kwargs: additional parameters to pass to the init system when
                      managing services. These will be passed as key=value
-                     parameters to the  init system's commandline. kwargs
+                     parameters to the init system's commandline. kwargs
                      are ignored for init systems not allowing additional
                      parameters via the commandline (systemd).
     """
@@ -190,7 +221,7 @@ def service_pause(service_name, init_dir="/etc/init", initd_dir="/etc/init.d",
         stopped = service_stop(service_name, **kwargs)
     upstart_file = os.path.join(init_dir, "{}.conf".format(service_name))
     sysv_file = os.path.join(initd_dir, service_name)
-    if init_is_systemd():
+    if init_is_systemd(service_name=service_name):
         service('disable', service_name)
         service('mask', service_name)
     elif os.path.exists(upstart_file):
@@ -212,7 +243,7 @@ def service_resume(service_name, init_dir="/etc/init",
                    initd_dir="/etc/init.d", **kwargs):
     """Resume a system service.
 
-    Reenable starting again at boot. Start the service.
+    Re-enable starting again at boot. Start the service.
 
     :param service_name: the name of the service to resume
     :param init_dir: the path to the init dir
@@ -224,9 +255,12 @@ def service_resume(service_name, init_dir="/etc/init",
     """
     upstart_file = os.path.join(init_dir, "{}.conf".format(service_name))
     sysv_file = os.path.join(initd_dir, service_name)
-    if init_is_systemd():
-        service('unmask', service_name)
-        service('enable', service_name)
+    if init_is_systemd(service_name=service_name):
+        if service('is-enabled', service_name):
+            log('service {} already enabled'.format(service_name), level=DEBUG)
+        else:
+            service('unmask', service_name)
+            service('enable', service_name)
     elif os.path.exists(upstart_file):
         override_path = os.path.join(
             init_dir, '{}.override'.format(service_name))
@@ -246,7 +280,7 @@ def service_resume(service_name, init_dir="/etc/init",
     return started
 
 
-def service(action, service_name, **kwargs):
+def service(action, service_name=None, **kwargs):
     """Control a system service.
 
     :param action: the action to take on the service
@@ -254,11 +288,13 @@ def service(action, service_name, **kwargs):
     :param **kwargs: additional params to be passed to the service command in
                     the form of key=value.
     """
-    if init_is_systemd():
-        cmd = ['systemctl', action, service_name]
+    if init_is_systemd(service_name=service_name):
+        cmd = ['systemctl', action]
+        if service_name is not None:
+            cmd.append(service_name)
     else:
         cmd = ['service', service_name, action]
-        for key, value in six.iteritems(kwargs):
+        for key, value in kwargs.items():
             parameter = '%s=%s' % (key, value)
             cmd.append(parameter)
     return subprocess.call(cmd) == 0
@@ -278,17 +314,17 @@ def service_running(service_name, **kwargs):
                      units (e.g. service ceph-osd status id=2). The kwargs
                      are ignored in systemd services.
     """
-    if init_is_systemd():
+    if init_is_systemd(service_name=service_name):
         return service('is-active', service_name)
     else:
         if os.path.exists(_UPSTART_CONF.format(service_name)):
             try:
                 cmd = ['status', service_name]
-                for key, value in six.iteritems(kwargs):
+                for key, value in kwargs.items():
                     parameter = '%s=%s' % (key, value)
                     cmd.append(parameter)
-                output = subprocess.check_output(cmd,
-                    stderr=subprocess.STDOUT).decode('UTF-8')
+                output = subprocess.check_output(
+                    cmd, stderr=subprocess.STDOUT).decode('UTF-8')
             except subprocess.CalledProcessError:
                 return False
             else:
@@ -308,8 +344,14 @@ def service_running(service_name, **kwargs):
 SYSTEMD_SYSTEM = '/run/systemd/system'
 
 
-def init_is_systemd():
-    """Return True if the host system uses systemd, False otherwise."""
+def init_is_systemd(service_name=None):
+    """
+    Returns whether the host uses systemd for the specified service.
+
+    @param Optional[str] service_name: specific name of service
+    """
+    if str(service_name).startswith("snap."):
+        return True
     if lsb_release()['DISTRIB_CODENAME'] == 'trusty':
         return False
     return os.path.isdir(SYSTEMD_SYSTEM)
@@ -442,7 +484,7 @@ def add_user_to_group(username, group):
 
 
 def chage(username, lastday=None, expiredate=None, inactive=None,
-           mindays=None, maxdays=None, root=None, warndays=None):
+          mindays=None, maxdays=None, root=None, warndays=None):
     """Change user password expiry information
 
     :param str username: User to update
@@ -482,7 +524,9 @@ def chage(username, lastday=None, expiredate=None, inactive=None,
     cmd.append(username)
     subprocess.check_call(cmd)
 
+
 remove_password_expiry = functools.partial(chage, expiredate='-1', inactive='-1', mindays='0', maxdays='-1')
+
 
 def rsync(from_path, to_path, flags='-r', options=None, timeout=None):
     """Replicate the contents of a path"""
@@ -535,13 +579,15 @@ def write_file(path, content, owner='root', group='root', perms=0o444):
     # lets see if we can grab the file and compare the context, to avoid doing
     # a write.
     existing_content = None
-    existing_uid, existing_gid = None, None
+    existing_uid, existing_gid, existing_perms = None, None, None
     try:
         with open(path, 'rb') as target:
             existing_content = target.read()
         stat = os.stat(path)
-        existing_uid, existing_gid = stat.st_uid, stat.st_gid
-    except:
+        existing_uid, existing_gid, existing_perms = (
+            stat.st_uid, stat.st_gid, stat.st_mode
+        )
+    except Exception:
         pass
     if content != existing_content:
         log("Writing file {} {}:{} {:o}".format(path, owner, group, perms),
@@ -549,12 +595,12 @@ def write_file(path, content, owner='root', group='root', perms=0o444):
         with open(path, 'wb') as target:
             os.fchown(target.fileno(), uid, gid)
             os.fchmod(target.fileno(), perms)
-            if six.PY3 and isinstance(content, six.string_types):
+            if isinstance(content, str):
                 content = content.encode('UTF-8')
             target.write(content)
         return
     # the contents were the same, but we might still need to change the
-    # ownership.
+    # ownership or permissions.
     if existing_uid != uid:
         log("Changing uid on already existing content: {} -> {}"
             .format(existing_uid, uid), level=DEBUG)
@@ -563,6 +609,10 @@ def write_file(path, content, owner='root', group='root', perms=0o444):
         log("Changing gid on already existing content: {} -> {}"
             .format(existing_gid, gid), level=DEBUG)
         os.chown(path, -1, gid)
+    if existing_perms != perms:
+        log("Changing permissions on existing content: {} -> {}"
+            .format(existing_perms, perms), level=DEBUG)
+        os.chmod(path, perms)
 
 
 def fstab_remove(mp):
@@ -660,7 +710,7 @@ def check_hash(path, checksum, hash_type='md5'):
 
     :param str checksum: Value of the checksum used to validate the file.
     :param str hash_type: Hash algorithm used to generate `checksum`.
-        Can be any hash alrgorithm supported by :mod:`hashlib`,
+        Can be any hash algorithm supported by :mod:`hashlib`,
         such as md5, sha1, sha256, sha512, etc.
     :raises ChecksumError: If the file fails the checksum
 
@@ -675,78 +725,227 @@ class ChecksumError(ValueError):
     pass
 
 
-def restart_on_change(restart_map, stopstart=False, restart_functions=None):
-    """Restart services based on configuration files changing
+class restart_on_change(object):
+    """Decorator and context manager to handle restarts.
 
-    This function is used a decorator, for example::
+    Usage:
 
-        @restart_on_change({
-            '/etc/ceph/ceph.conf': [ 'cinder-api', 'cinder-volume' ]
-            '/etc/apache/sites-enabled/*': [ 'apache2' ]
-            })
-        def config_changed():
-            pass  # your code here
+       @restart_on_change(restart_map, ...)
+       def function_that_might_trigger_a_restart(...)
+           ...
 
-    In this example, the cinder-api and cinder-volume services
-    would be restarted if /etc/ceph/ceph.conf is changed by the
-    ceph_client_changed function. The apache2 service would be
-    restarted if any file matching the pattern got changed, created
-    or removed. Standard wildcards are supported, see documentation
-    for the 'glob' module for more information.
+    Or:
 
-    @param restart_map: {path_file_name: [service_name, ...]
-    @param stopstart: DEFAULT false; whether to stop, start OR restart
-    @param restart_functions: nonstandard functions to use to restart services
-                              {svc: func, ...}
-    @returns result from decorated function
+       with restart_on_change(restart_map, ...):
+           do_stuff_that_might_trigger_a_restart()
+           ...
     """
-    def wrap(f):
+
+    def __init__(self, restart_map, stopstart=False, restart_functions=None,
+                 can_restart_now_f=None, post_svc_restart_f=None,
+                 pre_restarts_wait_f=None):
+        """
+        :param restart_map: {file: [service, ...]}
+        :type restart_map: Dict[str, List[str,]]
+        :param stopstart: whether to stop, start or restart a service
+        :type stopstart: booleean
+        :param restart_functions: nonstandard functions to use to restart
+                                  services {svc: func, ...}
+        :type restart_functions: Dict[str, Callable[[str], None]]
+        :param can_restart_now_f: A function used to check if the restart is
+                                  permitted.
+        :type can_restart_now_f: Callable[[str, List[str]], boolean]
+        :param post_svc_restart_f: A function run after a service has
+                                   restarted.
+        :type post_svc_restart_f: Callable[[str], None]
+        :param pre_restarts_wait_f: A function called before any restarts.
+        :type pre_restarts_wait_f: Callable[None, None]
+        """
+        self.restart_map = restart_map
+        self.stopstart = stopstart
+        self.restart_functions = restart_functions
+        self.can_restart_now_f = can_restart_now_f
+        self.post_svc_restart_f = post_svc_restart_f
+        self.pre_restarts_wait_f = pre_restarts_wait_f
+
+    def __call__(self, f):
+        """Work like a decorator.
+
+        Returns a wrapped function that performs the restart if triggered.
+
+        :param f: The function that is being wrapped.
+        :type f: Callable[[Any], Any]
+        :returns: the wrapped function
+        :rtype: Callable[[Any], Any]
+        """
         @functools.wraps(f)
         def wrapped_f(*args, **kwargs):
             return restart_on_change_helper(
-                (lambda: f(*args, **kwargs)), restart_map, stopstart,
-                restart_functions)
+                (lambda: f(*args, **kwargs)),
+                self.restart_map,
+                stopstart=self.stopstart,
+                restart_functions=self.restart_functions,
+                can_restart_now_f=self.can_restart_now_f,
+                post_svc_restart_f=self.post_svc_restart_f,
+                pre_restarts_wait_f=self.pre_restarts_wait_f)
         return wrapped_f
-    return wrap
+
+    def __enter__(self):
+        """Enter the runtime context related to this object. """
+        self.checksums = _pre_restart_on_change_helper(self.restart_map)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit the runtime context related to this object.
+
+        The parameters describe the exception that caused the context to be
+        exited. If the context was exited without an exception, all three
+        arguments will be None.
+        """
+        if exc_type is None:
+            _post_restart_on_change_helper(
+                self.checksums,
+                self.restart_map,
+                stopstart=self.stopstart,
+                restart_functions=self.restart_functions,
+                can_restart_now_f=self.can_restart_now_f,
+                post_svc_restart_f=self.post_svc_restart_f,
+                pre_restarts_wait_f=self.pre_restarts_wait_f)
+        # All is good, so return False; any exceptions will propagate.
+        return False
 
 
 def restart_on_change_helper(lambda_f, restart_map, stopstart=False,
-                             restart_functions=None):
+                             restart_functions=None,
+                             can_restart_now_f=None,
+                             post_svc_restart_f=None,
+                             pre_restarts_wait_f=None):
     """Helper function to perform the restart_on_change function.
 
     This is provided for decorators to restart services if files described
     in the restart_map have changed after an invocation of lambda_f().
 
-    @param lambda_f: function to call.
-    @param restart_map: {file: [service, ...]}
-    @param stopstart: whether to stop, start or restart a service
-    @param restart_functions: nonstandard functions to use to restart services
+    This functions allows for a number of helper functions to be passed.
+
+    `restart_functions` is a map with a service as the key and the
+    corresponding value being the function to call to restart the service. For
+    example if `restart_functions={'some-service': my_restart_func}` then
+    `my_restart_func` should a function which takes one argument which is the
+    service name to be retstarted.
+
+    `can_restart_now_f` is a function which checks that a restart is permitted.
+    It should return a bool which indicates if a restart is allowed and should
+    take a service name (str) and a list of changed files (List[str]) as
+    arguments.
+
+    `post_svc_restart_f` is a function which runs after a service has been
+    restarted. It takes the service name that was restarted as an argument.
+
+    `pre_restarts_wait_f` is a function which is called before any restarts
+    occur. The use case for this is an application which wants to try and
+    stagger restarts between units.
+
+    :param lambda_f: function to call.
+    :type lambda_f: Callable[[], ANY]
+    :param restart_map: {file: [service, ...]}
+    :type restart_map: Dict[str, List[str,]]
+    :param stopstart: whether to stop, start or restart a service
+    :type stopstart: booleean
+    :param restart_functions: nonstandard functions to use to restart services
                               {svc: func, ...}
-    @returns result of lambda_f()
+    :type restart_functions: Dict[str, Callable[[str], None]]
+    :param can_restart_now_f: A function used to check if the restart is
+                              permitted.
+    :type can_restart_now_f: Callable[[str, List[str]], boolean]
+    :param post_svc_restart_f: A function run after a service has
+                               restarted.
+    :type post_svc_restart_f: Callable[[str], None]
+    :param pre_restarts_wait_f: A function called before any restarts.
+    :type pre_restarts_wait_f: Callable[None, None]
+    :returns: result of lambda_f()
+    :rtype: ANY
+    """
+    checksums = _pre_restart_on_change_helper(restart_map)
+    r = lambda_f()
+    _post_restart_on_change_helper(checksums,
+                                   restart_map,
+                                   stopstart,
+                                   restart_functions,
+                                   can_restart_now_f,
+                                   post_svc_restart_f,
+                                   pre_restarts_wait_f)
+    return r
+
+
+def _pre_restart_on_change_helper(restart_map):
+    """Take a snapshot of file hashes.
+
+    :param restart_map: {file: [service, ...]}
+    :type restart_map: Dict[str, List[str,]]
+    :returns: Dictionary of file paths and the files checksum.
+    :rtype: Dict[str, str]
+    """
+    return {path: path_hash(path) for path in restart_map}
+
+
+def _post_restart_on_change_helper(checksums,
+                                   restart_map,
+                                   stopstart=False,
+                                   restart_functions=None,
+                                   can_restart_now_f=None,
+                                   post_svc_restart_f=None,
+                                   pre_restarts_wait_f=None):
+    """Check whether files have changed.
+
+    :param checksums: Dictionary of file paths and the files checksum.
+    :type checksums: Dict[str, str]
+    :param restart_map: {file: [service, ...]}
+    :type restart_map: Dict[str, List[str,]]
+    :param stopstart: whether to stop, start or restart a service
+    :type stopstart: booleean
+    :param restart_functions: nonstandard functions to use to restart services
+                              {svc: func, ...}
+    :type restart_functions: Dict[str, Callable[[str], None]]
+    :param can_restart_now_f: A function used to check if the restart is
+                              permitted.
+    :type can_restart_now_f: Callable[[str, List[str]], boolean]
+    :param post_svc_restart_f: A function run after a service has
+                               restarted.
+    :type post_svc_restart_f: Callable[[str], None]
+    :param pre_restarts_wait_f: A function called before any restarts.
+    :type pre_restarts_wait_f: Callable[None, None]
     """
     if restart_functions is None:
         restart_functions = {}
-    checksums = {path: path_hash(path) for path in restart_map}
-    r = lambda_f()
+    changed_files = defaultdict(list)
+    restarts = []
     # create a list of lists of the services to restart
-    restarts = [restart_map[path]
-                for path in restart_map
-                if path_hash(path) != checksums[path]]
+    for path, services in restart_map.items():
+        if path_hash(path) != checksums[path]:
+            restarts.append(services)
+            for svc in services:
+                changed_files[svc].append(path)
     # create a flat list of ordered services without duplicates from lists
     services_list = list(OrderedDict.fromkeys(itertools.chain(*restarts)))
     if services_list:
+        if pre_restarts_wait_f:
+            pre_restarts_wait_f()
         actions = ('stop', 'start') if stopstart else ('restart',)
         for service_name in services_list:
+            if can_restart_now_f:
+                if not can_restart_now_f(service_name,
+                                         changed_files[service_name]):
+                    continue
             if service_name in restart_functions:
                 restart_functions[service_name](service_name)
             else:
                 for action in actions:
                     service(action, service_name)
-    return r
+            if post_svc_restart_f:
+                post_svc_restart_f(service_name)
 
 
 def pwgen(length=None):
-    """Generate a random pasword."""
+    """Generate a random password."""
     if length is None:
         # A random length is ok to use a weak PRNG
         length = random.choice(range(35, 45))
@@ -758,7 +957,7 @@ def pwgen(length=None):
     random_generator = random.SystemRandom()
     random_chars = [
         random_generator.choice(alphanumeric_chars) for _ in range(length)]
-    return(''.join(random_chars))
+    return ''.join(random_chars)
 
 
 def is_phy_iface(interface):
@@ -799,7 +998,7 @@ def get_bond_master(interface):
 
 def list_nics(nic_type=None):
     """Return a list of nics of given type(s)"""
-    if isinstance(nic_type, six.string_types):
+    if isinstance(nic_type, str):
         int_types = [nic_type]
     else:
         int_types = nic_type
@@ -808,7 +1007,8 @@ def list_nics(nic_type=None):
     if nic_type:
         for int_type in int_types:
             cmd = ['ip', 'addr', 'show', 'label', int_type + '*']
-            ip_output = subprocess.check_output(cmd).decode('UTF-8')
+            ip_output = subprocess.check_output(
+                cmd).decode('UTF-8', errors='replace')
             ip_output = ip_output.split('\n')
             ip_output = (line for line in ip_output if line)
             for line in ip_output:
@@ -824,10 +1024,11 @@ def list_nics(nic_type=None):
                         interfaces.append(iface)
     else:
         cmd = ['ip', 'a']
-        ip_output = subprocess.check_output(cmd).decode('UTF-8').split('\n')
+        ip_output = subprocess.check_output(
+            cmd).decode('UTF-8', errors='replace').split('\n')
         ip_output = (line.strip() for line in ip_output if line)
 
-        key = re.compile('^[0-9]+:\s+(.+):')
+        key = re.compile(r'^[0-9]+:\s+(.+):')
         for line in ip_output:
             matched = re.search(key, line)
             if matched:
@@ -848,7 +1049,8 @@ def set_nic_mtu(nic, mtu):
 def get_nic_mtu(nic):
     """Return the Maximum Transmission Unit (MTU) for a network interface."""
     cmd = ['ip', 'addr', 'show', nic]
-    ip_output = subprocess.check_output(cmd).decode('UTF-8').split('\n')
+    ip_output = subprocess.check_output(
+        cmd).decode('UTF-8', errors='replace').split('\n')
     mtu = ""
     for line in ip_output:
         words = line.split()
@@ -860,7 +1062,7 @@ def get_nic_mtu(nic):
 def get_nic_hwaddr(nic):
     """Return the Media Access Control (MAC) for a network interface."""
     cmd = ['ip', '-o', '-0', 'addr', 'show', nic]
-    ip_output = subprocess.check_output(cmd).decode('UTF-8')
+    ip_output = subprocess.check_output(cmd).decode('UTF-8', errors='replace')
     hwaddr = ""
     words = ip_output.split()
     if 'link/ether' in words:
@@ -872,7 +1074,7 @@ def get_nic_hwaddr(nic):
 def chdir(directory):
     """Change the current working directory to a different directory for a code
     block and return the previous directory after the block exits. Useful to
-    run commands from a specificed directory.
+    run commands from a specified directory.
 
     :param str directory: The directory path to change to for this context.
     """
@@ -907,9 +1109,12 @@ def chownr(path, owner, group, follow_links=True, chowntopdir=False):
     for root, dirs, files in os.walk(path, followlinks=follow_links):
         for name in dirs + files:
             full = os.path.join(root, name)
-            broken_symlink = os.path.lexists(full) and not os.path.exists(full)
-            if not broken_symlink:
+            try:
                 chown(full, uid, gid)
+            except (IOError, OSError) as e:
+                # Intended to ignore "file not found".
+                if e.errno == errno.ENOENT:
+                    pass
 
 
 def lchownr(path, owner, group):
@@ -972,6 +1177,20 @@ def is_container():
 
 
 def add_to_updatedb_prunepath(path, updatedb_path=UPDATEDB_PATH):
+    """Adds the specified path to the mlocate's udpatedb.conf PRUNEPATH list.
+
+    This method has no effect if the path specified by updatedb_path does not
+    exist or is not a file.
+
+    @param path: string the path to add to the updatedb.conf PRUNEPATHS value
+    @param updatedb_path: the path the updatedb.conf file
+    """
+    if not os.path.exists(updatedb_path) or os.path.isdir(updatedb_path):
+        # If the updatedb.conf file doesn't exist then don't attempt to update
+        # the file as the package providing mlocate may not be installed on
+        # the local system
+        return
+
     with open(updatedb_path, 'r+') as f_id:
         updatedb_text = f_id.read()
         output = updatedb(updatedb_text, path)
@@ -993,7 +1212,7 @@ def updatedb(updatedb_text, new_path):
     return output
 
 
-def modulo_distribution(modulo=3, wait=30):
+def modulo_distribution(modulo=3, wait=30, non_zero_wait=False):
     """ Modulo distribution
 
     This helper uses the unit number, a modulo value and a constant wait time
@@ -1015,7 +1234,76 @@ def modulo_distribution(modulo=3, wait=30):
 
     @param modulo: int The modulo number creates the group distribution
     @param wait: int The constant time wait value
+    @param non_zero_wait: boolean Override unit % modulo == 0,
+                          return modulo * wait. Used to avoid collisions with
+                          leader nodes which are often given priority.
     @return: int Calculated time to wait for unit operation
     """
     unit_number = int(local_unit().split('/')[1])
-    return (unit_number % modulo) * wait
+    calculated_wait_time = (unit_number % modulo) * wait
+    if non_zero_wait and calculated_wait_time == 0:
+        return modulo * wait
+    else:
+        return calculated_wait_time
+
+
+def ca_cert_absolute_path(basename_without_extension):
+    """Returns absolute path to CA certificate.
+
+    :param basename_without_extension: Filename without extension
+    :type basename_without_extension: str
+    :returns: Absolute full path
+    :rtype: str
+    """
+    return '{}/{}.crt'.format(CA_CERT_DIR, basename_without_extension)
+
+
+def install_ca_cert(ca_cert, name=None):
+    """
+    Install the given cert as a trusted CA.
+
+    The ``name`` is the stem of the filename where the cert is written, and if
+    not provided, it will default to ``juju-{charm_name}``.
+
+    If the cert is empty or None, or is unchanged, nothing is done.
+    """
+    if not ca_cert:
+        return
+    if not isinstance(ca_cert, bytes):
+        ca_cert = ca_cert.encode('utf8')
+    if not name:
+        name = 'juju-{}'.format(charm_name())
+    cert_file = ca_cert_absolute_path(name)
+    new_hash = hashlib.md5(ca_cert).hexdigest()
+    if file_hash(cert_file) == new_hash:
+        return
+    log("Installing new CA cert at: {}".format(cert_file), level=INFO)
+    write_file(cert_file, ca_cert)
+    subprocess.check_call(['update-ca-certificates', '--fresh'])
+
+
+def get_system_env(key, default=None):
+    """Get data from system environment as represented in ``/etc/environment``.
+
+    :param key: Key to look up
+    :type key: str
+    :param default: Value to return if key is not found
+    :type default: any
+    :returns: Value for key if found or contents of default parameter
+    :rtype: any
+    :raises: subprocess.CalledProcessError
+    """
+    env_file = '/etc/environment'
+    # use the shell and env(1) to parse the global environments file.  This is
+    # done to get the correct result even if the user has shell variable
+    # substitutions or other shell logic in that file.
+    output = subprocess.check_output(
+        ['env', '-i', '/bin/bash', '-c',
+         'set -a && source {} && env'.format(env_file)],
+        universal_newlines=True)
+    for k, v in (line.split('=', 1)
+                 for line in output.splitlines() if '=' in line):
+        if k == key:
+            return v
+    else:
+        return default

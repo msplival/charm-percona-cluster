@@ -1,4 +1,4 @@
-# Copyright 2014-2015 Canonical Limited.
+# Copyright 2014-2021 Canonical Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,11 +20,7 @@ from charmhelpers.core.hookenv import (
     log,
 )
 
-import six
-if six.PY3:
-    from urllib.parse import urlparse, urlunparse
-else:
-    from urlparse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 
 # The order of this list is very important. Handlers should be listed in from
@@ -84,6 +80,7 @@ module = "charmhelpers.fetch.%s" % __platform__
 fetch = importlib.import_module(module)
 
 filter_installed_packages = fetch.filter_installed_packages
+filter_missing_packages = fetch.filter_missing_packages
 install = fetch.apt_install
 upgrade = fetch.apt_upgrade
 update = _fetch_update = fetch.apt_update
@@ -96,11 +93,17 @@ if __platform__ == "ubuntu":
     apt_update = fetch.apt_update
     apt_upgrade = fetch.apt_upgrade
     apt_purge = fetch.apt_purge
+    apt_autoremove = fetch.apt_autoremove
     apt_mark = fetch.apt_mark
     apt_hold = fetch.apt_hold
     apt_unhold = fetch.apt_unhold
     import_key = fetch.import_key
     get_upstream_version = fetch.get_upstream_version
+    apt_pkg = fetch.ubuntu_apt_pkg
+    get_apt_dpkg_env = fetch.get_apt_dpkg_env
+    get_installed_version = fetch.get_installed_version
+    OPENSTACK_RELEASES = fetch.OPENSTACK_RELEASES
+    UBUNTU_OPENSTACK_RELEASE = fetch.UBUNTU_OPENSTACK_RELEASE
 elif __platform__ == "centos":
     yum_search = fetch.yum_search
 
@@ -127,14 +130,14 @@ def configure_sources(update=False,
     sources = safe_load((config(sources_var) or '').strip()) or []
     keys = safe_load((config(keys_var) or '').strip()) or None
 
-    if isinstance(sources, six.string_types):
+    if isinstance(sources, str):
         sources = [sources]
 
     if keys is None:
         for source in sources:
             add_source(source, None)
     else:
-        if isinstance(keys, six.string_types):
+        if isinstance(keys, str):
             keys = [keys]
 
         if len(sources) != len(keys):
@@ -198,7 +201,7 @@ def plugins(fetch_handlers=None):
                 classname)
             plugin_list.append(handler_class())
         except NotImplementedError:
-            # Skip missing plugins so that they can be ommitted from
+            # Skip missing plugins so that they can be omitted from
             # installation if desired
             log("FetchHandler {} not found, skipping plugin".format(
                 handler_name))

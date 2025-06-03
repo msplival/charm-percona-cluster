@@ -17,4 +17,55 @@ backup:
       type: boolean
       default: false
       description: Make an incremental database backup
+complete-cluster-series-upgrade:
+  description: |
+    Perform final operations post series upgrade. Inform all nodes in the
+    cluster the upgrade is complete cluster wide. Update configuration with all
+    peers for wsrep replication.
+    This action should be performed on the current leader. Note the leader may
+    have changed during the series upgrade process.
+bootstrap-pxc:
+  description: |
+    Bootstrap this unit of Percona.
+    *WARNING* This action will bootstrap this unit of Percona cluster. This
+    should only occur in a recovery scenario. Make sure this unit has the
+    highest sequence number in grastate.dat or data loss may occur.
+    See upstream Percona documentation for context
+    https://www.percona.com/blog/2014/09/01/galera-replication-how-to-recover-a-pxc-cluster/
+notify-bootstrapped:
+   descripttion: Notify the cluster of the new bootstrap uuid.
+set-pxc-strict-mode:
+  description: |
+    Set PXC strict mode.
+  params:
+    mode:
+      type: string
+      default: "ENFORCING"
+      description: |
+        PXC strict mode. Valid options are DISALBED, PERMISSIVE, ENFORCING or MASTER
+        See https://www.percona.com/doc/percona-xtradb-cluster/LATEST/features/pxc-strict-mode.html
+        for more detail.
+mysqldump:
+  description: |
+    MySQL dump of databases. Action will return mysqldump-file location of the
+    requested backup in the results. If the databases parameter is unset all
+    databases will be dumped. If the databases parameter is set only the
+    databases specified will be dumped. Note it may be necessary to use the
+    set-pxc-strict-mode action first to set either PERMISSIVE or MASTER to
+    allow locking of tables for mysqldump to complete successfully.
+    See https://www.percona.com/doc/percona-xtradb-cluster/LATEST/features/pxc-strict-mode.html
+    for more detail.
+  params:
+    basedir:
+      type: string
+      default: "/var/backups/mysql"
+      description: The base directory for backups
+    databases:
+      description: |
+        Comma delimited database names to dump. If left unset, all databases
+        will be dumped.
+generate-nagios-password:
+  description: |
+    Re-generate the password for the nagios user. This action can only be run on the leader unit,
+    which sets a new password and then the `leader-settings-changed` hook will be activate.
 

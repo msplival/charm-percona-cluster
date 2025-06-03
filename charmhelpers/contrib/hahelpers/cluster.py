@@ -1,4 +1,4 @@
-# Copyright 2014-2015 Canonical Limited.
+# Copyright 2014-2021 Canonical Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,13 +25,12 @@ Helpers for clustering and determining "cluster leadership" and other
 clustering-related helpers.
 """
 
+import functools
 import subprocess
 import os
 import time
 
 from socket import gethostname as get_unit_hostname
-
-import six
 
 from charmhelpers.core.hookenv import (
     log,
@@ -85,7 +84,7 @@ def is_elected_leader(resource):
         2. If the charm is part of a corosync cluster, call corosync to
         determine leadership.
         3. If the charm is not part of a corosync cluster, the leader is
-        determined as being "the alive unit with the lowest unit numer". In
+        determined as being "the alive unit with the lowest unit number". In
         other words, the oldest surviving unit.
     """
     try:
@@ -124,16 +123,16 @@ def is_crm_dc():
     """
     cmd = ['crm', 'status']
     try:
-        status = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-        if not isinstance(status, six.text_type):
-            status = six.text_type(status, "utf-8")
+        status = subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT).decode('utf-8')
     except subprocess.CalledProcessError as ex:
         raise CRMDCNotFound(str(ex))
 
     current_dc = ''
     for line in status.split('\n'):
         if line.startswith('Current DC'):
-            # Current DC: juju-lytrusty-machine-2 (168108163) - partition with quorum
+            # Current DC: juju-lytrusty-machine-2 (168108163)
+            #  - partition with quorum
             current_dc = line.split(':')[1].split()[0]
     if current_dc == get_unit_hostname():
         return True
@@ -157,9 +156,8 @@ def is_crm_leader(resource, retry=False):
         return is_crm_dc()
     cmd = ['crm', 'resource', 'show', resource]
     try:
-        status = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-        if not isinstance(status, six.text_type):
-            status = six.text_type(status, "utf-8")
+        status = subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT).decode('utf-8')
     except subprocess.CalledProcessError:
         status = None
 
@@ -223,6 +221,18 @@ def https():
         return True
     if config_get('ssl_cert') and config_get('ssl_key'):
         return True
+    # Local import to avoid ciruclar dependency.
+    import charmhelpers.contrib.openstack.cert_utils as cert_utils
+    if (
+        cert_utils.get_certificate_request() and not
+        cert_utils.get_requests_for_local_unit("certificates")
+    ):
+        return False
+    for r_id in relation_ids('certificates'):
+        for unit in relation_list(r_id):
+            ca = relation_get('ca', rid=r_id, unit=unit)
+            if ca:
+                return True
     for r_id in relation_ids('identity-service'):
         for unit in relation_list(r_id):
             # TODO - needs fixing for new helper as ssl_cert/key suffixes with CN
@@ -276,6 +286,10 @@ def determine_apache_port(public_port, singlenode_mode=False):
     return public_port - (i * 10)
 
 
+determine_apache_port_single = functools.partial(
+    determine_apache_port, singlenode_mode=True)
+
+
 def get_hacluster_config(exclude_keys=None):
     '''
     Obtains all relevant configuration from charm configuration required
@@ -317,7 +331,7 @@ def valid_hacluster_config():
     '''
     vip = config_get('vip')
     dns = config_get('dns-ha')
-    if not(bool(vip) ^ bool(dns)):
+    if not (bool(vip) ^ bool(dns)):
         msg = ('HA: Either vip or dns-ha must be set but not both in order to '
                'use high availability')
         status_set('blocked', msg)
@@ -371,6 +385,7 @@ def distributed_wait(modulo=None, wait=None, operation_name='operation'):
     ''' Distribute operations by waiting based on modulo_distribution
 
     If modulo and or wait are not set, check config_get for those values.
+    If config values are not set, default to modulo=3 and wait=30.
 
     :param modulo: int The modulo number creates the group distribution
     :param wait: int The constant time wait value
@@ -382,12 +397,59 @@ def distributed_wait(modulo=None, wait=None, operation_name='operation'):
     :side effect: Calls time.sleep()
     '''
     if modulo is None:
-        modulo = config_get('modulo-nodes')
+        modulo = config_get('modulo-nodes') or 3
     if wait is None:
-        wait = config_get('known-wait')
-    calculated_wait = modulo_distribution(modulo=modulo, wait=wait)
+        wait = config_get('known-wait') or 30
+    if juju_is_leader():
+        # The leader should never wait
+        calculated_wait = 0
+    else:
+        # non_zero_wait=True guarantees the non-leader who gets modulo 0
+        # will still wait
+        calculated_wait = modulo_distribution(modulo=modulo, wait=wait,
+                                              non_zero_wait=True)
     msg = "Waiting {} seconds for {} ...".format(calculated_wait,
                                                  operation_name)
     log(msg, DEBUG)
     status_set('maintenance', msg)
     time.sleep(calculated_wait)
+
+
+def get_managed_services_and_ports(services, external_ports,
+                                   external_services=None,
+                                   port_conv_f=determine_apache_port_single):
+    """Get the services and ports managed by this charm.
+
+    Return only the services and corresponding ports that are managed by this
+    charm. This excludes haproxy when there is a relation with hacluster. This
+    is because this charm passes responsibility for stopping and starting
+    haproxy to hacluster.
+
+    Similarly, if a relation with hacluster exists then the ports returned by
+    this method correspond to those managed by the apache server rather than
+    haproxy.
+
+    :param services: List of services.
+    :type services: List[str]
+    :param external_ports: List of ports managed by external services.
+    :type external_ports: List[int]
+    :param external_services: List of services to be removed if ha relation is
+                              present.
+    :type external_services: List[str]
+    :param port_conv_f: Function to apply to ports to calculate the ports
+                        managed by services controlled by this charm.
+    :type port_convert_func: f()
+    :returns: A tuple containing a list of services first followed by a list of
+              ports.
+    :rtype: Tuple[List[str], List[int]]
+    """
+    if external_services is None:
+        external_services = ['haproxy']
+    if relation_ids('ha'):
+        for svc in external_services:
+            try:
+                services.remove(svc)
+            except ValueError:
+                pass
+        external_ports = [port_conv_f(p) for p in external_ports]
+    return services, external_ports

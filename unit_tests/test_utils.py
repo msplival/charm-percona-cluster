@@ -1,11 +1,15 @@
+import io
 import os
 import logging
+import sys
 import unittest
 
 import yaml
 
 from contextlib import contextmanager
-from mock import patch, MagicMock
+from unittest.mock import patch, MagicMock
+
+from charmhelpers.core.unitdata import Record
 
 
 def load_config():
@@ -24,10 +28,10 @@ def load_config():
 
     if not config:
         logging.error('Could not find config.yaml in any parent directory '
-                      'of %s. ' % file)
+                      'of %s. ' % __file__)
         raise Exception
 
-    return yaml.safe_load(open(config).read())['options']
+    return yaml.safe_load(open(config, encoding="UTF-8").read())['options']
 
 
 def get_default_config():
@@ -37,7 +41,7 @@ def get_default_config():
     '''
     default_config = {}
     config = load_config()
-    for k, v in config.iteritems():
+    for k, v in config.items():
         if 'default' in v:
             default_config[k] = v['default']
         else:
@@ -125,17 +129,72 @@ class TestRelation(object):
 
 @contextmanager
 def patch_open():
-    '''Patch open() to allow mocking both open() itself and the file that is
+    """Patch open().
+
+    Patch open() to allow mocking both open() itself and the file that is
     yielded.
 
-    Yields the mock for "open" and "file", respectively.'''
+    Yields the mock for "open" and "file", respectively.
+    """
     mock_open = MagicMock(spec=open)
-    mock_file = MagicMock(spec=file)
+    mock_file = MagicMock(spec=io.FileIO)
 
     @contextmanager
     def stub_open(*args, **kwargs):
         mock_open(*args, **kwargs)
         yield mock_file
 
-    with patch('__builtin__.open', stub_open):
+    with patch('builtins.open', stub_open):
         yield mock_open, mock_file
+
+
+class FakeKvStore():
+
+    def __init__(self):
+        self._store = {}
+        self._closed = False
+        self._flushed = False
+
+    def close(self):
+        self._closed = True
+        self._flushed = True
+
+    def get(self, key, default=None, record=False):
+        if key not in self._store:
+            return default
+        if record:
+            return Record(self._store[key])
+        return self._store[key]
+
+    def getrange(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def update(self, mapping, prefix=""):
+        for k, v in mapping.items():
+            self.set("%s%s" % (prefix, k), v)
+
+    def unset(self, key):
+        if key in self._store:
+            del self._store[key]
+
+    def unsetrange(self, keys=None, prefix=""):
+        raise NotImplementedError
+
+    def set(self, key, value):
+        self._store[key] = value
+        return value
+
+    def delta(self, mapping, prefix):
+        raise NotImplementedError
+
+    def hook_scope(self, name=""):
+        raise NotImplementedError
+
+    def flush(self, save=True):
+        self._flushed = True
+
+    def gethistory(self, key, deserialize=False):
+        raise NotImplementedError
+
+    def debug(self, fh=sys.stderr):
+        raise NotImplementedError

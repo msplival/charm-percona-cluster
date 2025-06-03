@@ -94,7 +94,7 @@ class ApacheConfContext(object):
         settings = utils.get_settings('apache')
         ctxt = settings['hardening']
 
-        out = subprocess.check_output(['apache2', '-v'])
+        out = subprocess.check_output(['apache2', '-v']).decode('utf-8')
         ctxt['apache_version'] = re.search(r'.+version: Apache/(.+?)\s.+',
                                            out).group(1)
         ctxt['apache_icondir'] = '/usr/share/apache2/icons/'

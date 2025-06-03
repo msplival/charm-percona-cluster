@@ -44,6 +44,10 @@ myisam-recover         = {{ myisam_recover }}
 max_connections = {{ max_connections }}
 {% endif %}
 
+{% if max_connect_errors %}
+max_connect_errors = {{ max_connect_errors }}
+{% endif %}
+
 {% if wait_timeout != -1 -%}
 # Seconds before clearing idle connections
 wait_timeout = {{ wait_timeout }}
@@ -66,18 +70,40 @@ query_cache_size        = 16M
 #
 # Error log - should be very few entries.
 #
+# Optionally enable syslog instead, addressing bug:
+# https://bugs.launchpad.net/charm-percona-cluster/+bug/1812950
+{% if use_syslog -%}
+log_syslog = {{ use_syslog }}
+{% else -%}
 log_error = /var/log/mysql/error.log
+{% endif %}
 
 #
 # The following can be used as easy to replay backup logs or for replication.
 # note: if you are setting up a replication slave, see README.Debian about
 #       other settings you may need to change.
-{% if enable_binlogs -%}
+{% if enable_binlogs or databases_to_replicate -%}
+server_id = {{ server_id }}
 log_bin={{ binlogs_path }}
 {% endif %}
 
 expire_logs_days        = {{ binlogs_expire_days }}
 max_binlog_size         = {{ binlogs_max_size }}
+
+{% if databases_to_replicate -%}
+# MySQL asynchronous replication
+log_slave_updates = 1
+{% for entry in databases_to_replicate -%}
+replicate_do_db = {{ entry.database }}
+{% if entry.tables -%}
+{% for table in entry.tables -%}
+replicate_do_table = {{ entry.database }}.{{ table }}
+{% endfor %}
+{% else -%}
+replicate_wild_do_table = {{ entry.database }}.%
+{% endif %}
+{% endfor %}
+{% endif %}
 
 # Required to allow trigger creation for openstack services
 log_bin_trust_function_creators = 1
@@ -131,13 +157,9 @@ innodb_autoinc_lock_mode = {{ innodb_autoinc_lock_mode }}
 wsrep_provider={{ wsrep_provider }}
 
 # Add address of other cluster nodes here
-{% if not clustered and is_leader -%}
-# Empty gcomm address is being used when cluster is getting bootstrapped
-wsrep_cluster_address=gcomm://
-{% else -%}
 # Cluster connection URL contains the IPs of node#1, node#2 and node#3
+# Empty when bootstrapping the cluster
 wsrep_cluster_address=gcomm://{{ cluster_hosts }}
-{% endif %}
 
 #
 # Node address
@@ -159,6 +181,10 @@ wsrep_log_conflicts
 
 {% if wsrep_provider_options -%}
 wsrep_provider_options = {{ wsrep_provider_options }}
+{% endif %}
+
+{% if wsrep_slave_threads -%}
+wsrep_slave_threads = {{ wsrep_slave_threads }}
 {% endif %}
 
 #
